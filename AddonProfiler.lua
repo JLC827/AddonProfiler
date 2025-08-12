@@ -1419,13 +1419,13 @@ function NAP:InitUI()
             end
 
             for i, info in ipairs(tabInfo) do
-                local tab = CreateFrame("Button", "$parentTab" .. i, display, "CharacterFrameTabButtonTemplate")
+                local tab = CreateFrame("Button", "$parentTab" .. i, display, "TabButtonTemplate")
                 tab:SetID(i)
                 tab:SetText(info.name)
                 if i == 1 then
                     tab:SetPoint("TOPLEFT", 8, -32)
                 else
-                    tab:SetPoint("TOPLEFT", display.tabs[i-1], "TOPRIGHT", -16, 0)
+                    tab:SetPoint("TOPLEFT", display.tabs[i-1], "TOPRIGHT", -2, 0)
                 end
                 tab.view = info.view
                 tab:SetScript("OnClick", OnTabClick)
