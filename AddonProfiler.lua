@@ -1309,14 +1309,18 @@ function NAP:InitUI()
             function display:DoUpdate(force)
                 local bucketsWithinHistory, overallSnapshotOverrides = NAP:PrepareFilteredData(force)
                 if overallSnapshotOverrides then
-                    self.TotalRow:Update(nil, bucketsWithinHistory, overallSnapshotOverrides)
+                    if self.tableView:IsShown() then
+                        self.TotalRow:Update(nil, bucketsWithinHistory, overallSnapshotOverrides)
 
-                    local perc = self.ScrollBox:GetScrollPercentage()
-                    self.ScrollBox:Flush()
+                        local perc = self.ScrollBox:GetScrollPercentage()
+                        self.ScrollBox:Flush()
 
-                    if NAP.dataProvider then
-                        self.ScrollBox:SetDataProvider(NAP.dataProvider)
-                        self.ScrollBox:SetScrollPercentage(perc)
+                        if NAP.dataProvider then
+                            self.ScrollBox:SetDataProvider(NAP.dataProvider)
+                            self.ScrollBox:SetScrollPercentage(perc)
+                        end
+                    elseif self.graphView:IsShown() then
+                        self:UpdateGraph(bucketsWithinHistory, overallSnapshotOverrides)
                     end
 
                     self.Stats:Update()
@@ -1402,7 +1406,249 @@ function NAP:InitUI()
 
             display:SetTitle("|cffe03d02Numy:|r Addon Profiler")
 
-            display.Inset:SetPoint("TOPLEFT", 8, (-86) - ROW_HEIGHT)
+            -- Create Tab buttons
+            display.tabs = {}
+            local tabInfo = {
+                { name = "Table", view = "table" },
+                { name = "Graph", view = "graph" },
+            }
+
+            local function OnTabClick(self)
+                PanelTemplates_SetTab(display, self:GetID())
+                display:ShowView(self.view)
+            end
+
+            for i, info in ipairs(tabInfo) do
+                local tab = CreateFrame("Button", "$parentTab" .. i, display, "CharacterFrameTabButtonTemplate")
+                tab:SetID(i)
+                tab:SetText(info.name)
+                if i == 1 then
+                    tab:SetPoint("TOPLEFT", 8, -32)
+                else
+                    tab:SetPoint("TOPLEFT", display.tabs[i-1], "TOPRIGHT", -16, 0)
+                end
+                tab.view = info.view
+                tab:SetScript("OnClick", OnTabClick)
+                t_insert(display.tabs, tab)
+            end
+            PanelTemplates_SetTab(display, 1)
+
+            -- Create view containers
+            local tableView = CreateFrame("Frame", nil, display.Inset)
+            display.tableView = tableView
+            tableView:SetAllPoints()
+            tableView:Show()
+
+            local graphView = CreateFrame("Frame", nil, display.Inset)
+            display.graphView = graphView
+            graphView:SetAllPoints()
+            graphView:Hide()
+
+            -- Graph View
+            local graphContainer = CreateFrame("Frame", nil, graphView)
+            graphContainer:SetPoint("TOPLEFT", 10, -10)
+            graphContainer:SetPoint("BOTTOMRIGHT", -150, 10)
+            display.graphContainer = graphContainer
+
+            -- Legend
+            local legendContainer = CreateFrame("Frame", nil, graphView)
+            legendContainer:SetPoint("TOPLEFT", graphContainer, "TOPRIGHT", 10, 0)
+            legendContainer:SetPoint("BOTTOMRIGHT", -10, 10)
+            display.legendContainer = legendContainer
+
+            function display:UpdateGraph(bucketsWithinHistory, overallSnapshotOverrides)
+                local historyType, _ = NAP:GetActiveHistoryRange()
+                if historyType ~= HISTORY_TYPE_TIME_RANGE then
+                    if not self.graphContainer.notAvailableText then
+                        self.graphContainer.notAvailableText = self.graphContainer:CreateFontString(nil, "ARTWORK", "GameFontHighlightLarge")
+                        self.graphContainer.notAvailableText:SetPoint("CENTER")
+                        self.graphContainer.notAvailableText:SetText("Graph is only available for 'Last X Seconds' history range.")
+                    end
+                    self.graphContainer.notAvailableText:Show()
+                    if self.graphContainer.lineSegmentPool then
+                        self.graphContainer.lineSegmentPool:ReleaseAll()
+                    end
+                    if self.legendContainer.legendItemsPool then
+                        self.legendContainer.legendItemsPool:ReleaseAll()
+                    end
+                    return
+                else
+                    if self.graphContainer.notAvailableText then
+                        self.graphContainer.notAvailableText:Hide()
+                    end
+                end
+
+                self.graphContainer:Hide()
+
+                local data = {}
+                local totals = {}
+                local max_ms = 0
+                local min_time, max_time = math.huge, 0
+
+                if bucketsWithinHistory then
+                    for bucket, startingTickIndex in pairs(bucketsWithinHistory) do
+                        for tickIndex = startingTickIndex, bucket.curTickIndex do
+                            local timestamp = bucket.tickMap[tickIndex]
+                            if timestamp then
+                                min_time = math.min(min_time, timestamp)
+                                max_time = math.max(max_time, timestamp)
+                                local total_ms_for_tick = 0
+                                for addonName, lastTicks in pairs(bucket.lastTick) do
+                                    local ms = lastTicks[tickIndex]
+                                    if ms and ms > 0 then
+                                        if not data[addonName] then data[addonName] = {} end
+                                        t_insert(data[addonName], { x = timestamp, y = ms })
+                                        max_ms = math.max(max_ms, ms)
+                                        if addonName ~= TOTAL_ADDON_METRICS_KEY then
+                                            total_ms_for_tick = total_ms_for_tick + ms
+                                        end
+                                    end
+                                end
+                                if total_ms_for_tick > 0 then
+                                    if not totals[timestamp] then totals[timestamp] = 0 end
+                                    totals[timestamp] = totals[timestamp] + total_ms_for_tick
+                                end
+                            end
+                        end
+                    end
+                end
+
+                if not next(data) then
+                    self.graphContainer:Show()
+                    return
+                end
+
+                local graphWidth = self.graphContainer:GetWidth()
+                local graphHeight = self.graphContainer:GetHeight()
+                local time_range = max_time - min_time
+                if time_range == 0 then time_range = 1 end
+
+                local function scale(x, y)
+                    local scaled_x = (x - min_time) / time_range * graphWidth
+                    local scaled_y = max_ms > 0 and (y / (max_ms * 1.1) * graphHeight) or 0 -- 10% buffer at the top
+                    return scaled_x, scaled_y
+                end
+
+                if not self.graphContainer.lineSegmentPool then
+                    self.graphContainer.lineSegmentPool = CreateFramePool("Frame", self.graphContainer, "BackdropTemplate")
+                    self.graphContainer.lineSegmentPool:SetCreator(function(_, frame)
+                        frame:SetBackdrop({ bgFile = "Interface/Tooltips/UI-Tooltip-Background" })
+                    end)
+                end
+                self.graphContainer.lineSegmentPool:ReleaseAll()
+
+                -- Axes
+                if not self.graphContainer.xAxis then
+                    local xAxis = CreateFrame("Frame", nil, self.graphContainer)
+                    xAxis:SetPoint("BOTTOMLEFT")
+                    xAxis:SetPoint("BOTTOMRIGHT")
+                    xAxis:SetHeight(1)
+                    xAxis:SetBackdrop({ bgFile = "Interface/Tooltips/UI-Tooltip-Background" })
+                    xAxis:SetBackdropColor(1, 1, 1, 0.5)
+                    self.graphContainer.xAxis = xAxis
+
+                    local xLabel = self.graphContainer:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+                    xLabel:SetPoint("TOP", xAxis, "BOTTOM", 0, -2)
+                    xLabel:SetText("Time")
+                end
+
+                if not self.graphContainer.yAxis then
+                    local yAxis = CreateFrame("Frame", nil, self.graphContainer)
+                    yAxis:SetPoint("TOPLEFT")
+                    yAxis:SetPoint("BOTTOMLEFT")
+                    yAxis:SetWidth(1)
+                    yAxis:SetBackdrop({ bgFile = "Interface/Tooltips/UI-Tooltip-Background" })
+                    yAxis:SetBackdropColor(1, 1, 1, 0.5)
+                    self.graphContainer.yAxis = yAxis
+
+                    local yLabel = self.graphContainer:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+                    yLabel:SetPoint("LEFT", yAxis, "RIGHT", 3, 0)
+                    yLabel:SetText("CPU (ms)")
+                end
+
+                local colors = { {1,0,0}, {0,1,0}, {0,0,1}, {1,1,0}, {1,0,1}, {0,1,1}, {1,1,1} }
+                local color_index = 1
+                local addonColors = {}
+
+                local function draw_line(points, color)
+                    for i = 1, #points - 1 do
+                        local p1 = points[i]
+                        local p2 = points[i+1]
+                        local x1, y1 = scale(p1.x, p1.y)
+                        local x2, y2 = scale(p2.x, p2.y)
+
+                        local segment = self.graphContainer.lineSegmentPool:Acquire()
+                        local dx = x2 - x1
+                        local dy = y2 - y1
+                        if dx ~= 0 or dy ~= 0 then
+                            local len = sqrt(dx*dx + dy*dy)
+                            local angle = atan2(dy, dx)
+                            segment:SetWidth(len)
+                            segment:SetHeight(2)
+                            segment:SetPoint("BOTTOMLEFT", self.graphContainer, "BOTTOMLEFT", x1, y1)
+                            segment:SetRotation(angle)
+                            segment:SetBackdropColor(unpack(color))
+                            segment:Show()
+                        end
+                    end
+                end
+
+                for addonName, points in pairs(data) do
+                    if addonName ~= TOTAL_ADDON_METRICS_KEY then
+                        local color = colors[color_index]
+                        addonColors[addonName] = color
+                        draw_line(points, color)
+                        color_index = (color_index % #colors) + 1
+                    end
+                end
+
+                -- Draw total line
+                local total_points = {}
+                for t, ms in pairs(totals) do
+                    t_insert(total_points, {x=t, y=ms})
+                end
+                table.sort(total_points, function(a,b) return a.x < b.x end)
+                draw_line(total_points, {1, 1, 0}) -- Yellow for total
+                addonColors["Total"] = {1,1,0}
+
+                -- Legend
+                if not self.legendContainer.legendItemsPool then
+                    self.legendContainer.legendItemsPool = CreateFramePool("Frame", self.legendContainer)
+                    self.legendContainer.legendItemsPool:SetCreator(function(_, frame)
+                        frame.swatch = frame:CreateTexture(nil, "ARTWORK")
+                        frame.swatch:SetSize(16, 16)
+                        frame.swatch:SetPoint("LEFT")
+                        frame.text = frame:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+                        frame.text:SetPoint("LEFT", frame.swatch, "RIGHT", 5, 0)
+                    end)
+                end
+                self.legendContainer.legendItemsPool:ReleaseAll()
+
+                local y_offset = -10
+                for addonName, color in pairs(addonColors) do
+                    local item = self.legendContainer.legendItemsPool:Acquire()
+                    item.swatch:SetColorTexture(unpack(color))
+                    item.text:SetText(addonName == "Total" and "Total" or NAP.addons[addonName].title)
+                    item:SetPoint("TOPLEFT", 10, y_offset)
+                    item:Show()
+                    y_offset = y_offset - 20
+                end
+
+                self.graphContainer:Show()
+            end
+
+            function display:ShowView(viewName)
+                if viewName == "table" then
+                    self.tableView:Show()
+                    self.graphView:Hide()
+                elseif viewName == "graph" then
+                    self.tableView:Hide()
+                    self.graphView:Show()
+                    self:DoUpdate(true)
+                end
+            end
+
+            display.Inset:SetPoint("TOPLEFT", 8, (-86) - ROW_HEIGHT - 30)
             display.Inset:SetPoint("BOTTOMRIGHT", -4, 30)
 
             function display:UpdateHeaders()
@@ -1723,11 +1969,11 @@ function NAP:InitUI()
             end)
         end
 
-        local headers = CreateFrame("Button", "$parentHeaders", display, "ColumnDisplayTemplate")
+        local headers = CreateFrame("Button", "$parentHeaders", display.tableView, "ColumnDisplayTemplate")
         display.Headers = headers
         do
-            headers:SetPoint("BOTTOMLEFT", display.Inset, "TOPLEFT", 1, ROW_HEIGHT + 1)
-            headers:SetPoint("BOTTOMRIGHT", display.Inset, "TOPRIGHT", 0, -1)
+            headers:SetPoint("BOTTOMLEFT", display.tableView, "TOPLEFT", 1, ROW_HEIGHT + 1)
+            headers:SetPoint("BOTTOMRIGHT", display.tableView, "TOPRIGHT", 0, -1)
 
             function headers:UpdateArrow()
                 local sort, order = display:GetActiveSort()
@@ -1796,11 +2042,11 @@ function NAP:InitUI()
             display:UpdateHeaders()
         end
 
-        local scrollBox = CreateFrame("Frame", "$parentScrollBox", display, "WowScrollBoxList")
+        local scrollBox = CreateFrame("Frame", "$parentScrollBox", display.tableView, "WowScrollBoxList")
         display.ScrollBox = scrollBox
         do
-            scrollBox:SetPoint("TOPLEFT", display.Inset, "TOPLEFT", 4, -3)
-            scrollBox:SetPoint("BOTTOMRIGHT", display.Inset, "BOTTOMRIGHT", -22, 2)
+            scrollBox:SetPoint("TOPLEFT", display.tableView, "TOPLEFT", 4, -3)
+            scrollBox:SetPoint("BOTTOMRIGHT", display.tableView, "BOTTOMRIGHT", -22, 2)
 
             local function alternateBG()
                 local index = scrollBox:GetDataIndexBegin()
@@ -1976,7 +2222,7 @@ function NAP:InitUI()
             end
         end
 
-        local totalRow = makeStandaloneRow(display)
+        local totalRow = makeStandaloneRow(display.tableView)
         display.TotalRow = totalRow
         do
             totalRow:Init(TOTAL_ADDON_METRICS_KEY)
@@ -2006,7 +2252,7 @@ function NAP:InitUI()
             ScrollUtil.InitScrollBoxListWithScrollBar(scrollBox, scrollBar, view)
         end
 
-        local noDataText = display:CreateFontString(nil, "ARTWORK", "GameFontHighlightLarge")
+        local noDataText = display.tableView:CreateFontString(nil, "ARTWORK", "GameFontHighlightLarge")
         display.NoDataText = noDataText
         do
             noDataText:Hide()
@@ -2225,7 +2471,7 @@ function NAP:InitUI()
             end)
         end
 
-        display.ProfilingDisabledWarning = CreateFrame("Frame", nil, display)
+        display.ProfilingDisabledWarning = CreateFrame("Frame", nil, display.tableView)
         do
             local warning = display.ProfilingDisabledWarning
             warning:Hide()
